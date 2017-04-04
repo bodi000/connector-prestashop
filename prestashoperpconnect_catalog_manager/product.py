@@ -36,10 +36,10 @@ from openerp.osv import fields, orm
 import openerp.addons.decimal_precision as dp
 
 @on_record_create(model_names='prestashop.product.product')
-def prestashop_product_product_create(session, model_name, record_id):
+def prestashop_product_product_create(session, model_name, record_id, fields=None):
     if session.context.get('connector_no_export'):
         return
-    export_record.delay(session, model_name, record_id, priority=20)
+    export_record.delay(session, model_name, record_id, fields, priority=20)
 
 @on_record_write(model_names='prestashop.product.product')
 def prestashop_product_product_write(session, model_name, record_id, fields):

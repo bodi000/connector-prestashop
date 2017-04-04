@@ -46,15 +46,28 @@ class PrestaShopWebServiceImage(PrestaShopWebServiceDict):
             self._validate_query_options(options)
             full_url += "?%s" % (self._options_to_querystring(options),)
         response = self._execute(full_url, 'GET')
+        if response.content:
+            image_content = base64.b64encode(response.content)
+        else:
+            image_content = ''
 
-        image_content = base64.b64encode(response.content)
-
-        return {
+        record = {
             'type': response.headers['content-type'],
             'content': image_content,
             'id_' + resource[:-1]: resource_id,
-            'id_image': image_id
+            'id_image': image_id,
         }
+        record['full_public_url'] = self.get_image_public_url(record)
+        return record
+
+    def get_image_public_url(self, record):
+        url = self._api_url.replace('/api', '')
+        url += '/img/p/' + '/'.join(list(record['id_image']))
+        extension = ''
+        if record['type'] == 'image/jpeg':
+            extension = '.jpg'
+        url += '/' + record['id_image'] + extension
+        return url
 
 
 class PrestaShopLocation(object):
@@ -62,7 +75,11 @@ class PrestaShopLocation(object):
     def __init__(self, location, webservice_key):
         self.location = location
         self.webservice_key = webservice_key
-        self.api_url = '%s/api' % location
+        if not location.endswith('/api'):
+            location = location + '/api'
+        if not location.startswith('http'):
+            location = 'http://' + location
+        self.api_url = location
 
 
 class PrestaShopCRUDAdapter(CRUDAdapter):
@@ -155,12 +172,6 @@ class GenericAdapter(PrestaShopCRUDAdapter):
         api = self.connect()
         """ Delete a record(s) on the external system """
         return api.delete(self._prestashop_model, ids)
-
-
-@prestashop
-class ShopGroupAdapter(GenericAdapter):
-    _model_name = 'prestashop.shop.group'
-    _prestashop_model = 'shop_groups'
 
 
 @prestashop

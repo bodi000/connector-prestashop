@@ -1,3 +1,5 @@
+from . import account_payment_mode
+from . import prestashop_backend
 import prestashop_model
 import account
 import connector

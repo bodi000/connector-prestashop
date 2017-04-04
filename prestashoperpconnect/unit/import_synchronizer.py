@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-/
+# -*- coding: utf-8 -*-
 ##############################################################################
 #
 #    Prestashoperpconnect : OpenERP-PrestaShop connector
@@ -24,27 +24,71 @@
 ##############################################################################
 
 import logging
+from contextlib import closing, contextmanager
+
 from datetime import datetime
 from datetime import timedelta
 from openerp.tools import DEFAULT_SERVER_DATETIME_FORMAT
+from openerp.modules.registry import RegistryManager
 from openerp.addons.connector.queue.job import job
 from openerp.addons.connector.unit.synchronizer import ImportSynchronizer
-from openerp.addons.connector.connector import ConnectorUnit
+from openerp.addons.connector.connector import ConnectorUnit, Binder
+from openerp.addons.connector.session import ConnectorSession
+from openerp.addons.connector.exception import (
+    RetryableJobError,
+    FailedJobError,
+    NothingToDoJob,
+)
 from ..backend import prestashop
 from ..connector import get_environment
 from backend_adapter import GenericAdapter
 from .exception import OrderImportRuleRetry
-from openerp.addons.connector.exception import FailedJobError
-from openerp.addons.connector.exception import NothingToDoJob
 from backend_adapter import PrestaShopCRUDAdapter
-from openerp.addons.connector.connector import Binder
 
 from prestapyt import PrestaShopWebServiceError
 from ..connector import add_checkpoint
+from openerp.osv import fields, osv
 
 
 _logger = logging.getLogger(__name__)
 
+RETRY_ON_ADVISORY_LOCK = 1  # seconds
+RETRY_WHEN_CONCURRENT_DETECTED = 1  # seconds
+
+
+class PrestashopBaseImportSynchronizer(ImportSynchronizer):
+
+    def _import_dependency(self, prestashop_id, binding_model,
+                           importer_class=None, always=False,
+                           **kwargs):
+        """
+        Import a dependency. The importer class is a subclass of
+        ``PrestashopImporter``. A specific class can be defined.
+
+        :param prestashop_id: id of the prestashop id to import
+        :param binding_model: name of the binding model for the relation
+        :type binding_model: str | unicode
+        :param importer_cls: :py:class:`openerp.addons.connector.\
+                                        connector.ConnectorUnit`
+                             class or parent class to use for the export.
+                             By default: PrestashopImporter
+        :type importer_cls: :py:class:`openerp.addons.connector.\
+                                       connector.MetaConnectorUnit`
+        :param always: if True, the record is updated even if it already
+                       exists,
+                       it is still skipped if it has not been modified on
+                       PrestaShop
+        :type always: boolean
+        :param kwargs: additional keyword arguments are passed to the importer
+        """
+        if not prestashop_id:
+            return
+        if importer_class is None:
+            importer_class = PrestashopImportSynchronizer
+        binder = self.binder_for(binding_model)
+        if always or not binder.to_odoo(prestashop_id):
+            importer = self.unit_for(importer_class, model=binding_model)
+            importer.run(prestashop_id, **kwargs)
 
 class PrestashopImportSynchronizer(ImportSynchronizer):
     """ Base importer for Prestashop """
@@ -70,6 +114,13 @@ class PrestashopImportSynchronizer(ImportSynchronizer):
         """ Import the dependencies for the record"""
         return
 
+    def _map_data(self):
+        """ Returns an instance of
+        :py:class:`~openerp.addons.connector.unit.mapper.MapRecord`
+
+        """
+        return self.mapper.map_record(self.prestashop_record)
+
     def _validate_data(self, data):
         """ Check if the values to import are correct
 
@@ -80,51 +131,171 @@ class PrestashopImportSynchronizer(ImportSynchronizer):
         """
         return
 
-    def _get_openerp_id(self):
+    def _get_binding(self):
         """Return the openerp id from the prestashop id"""
         return self.binder.to_openerp(self.prestashop_id)
 
     def _context(self, **kwargs):
         return dict(self.session.context, connector_no_export=True, **kwargs)
 
+    def _create_context(self):
+        return {'connector_no_export': True}
+
+    def _create_data(self, map_record):
+        return map_record.values(for_create=True)
+
+    def _update_data(self, map_record):
+        return map_record.values()
+
     def _create(self, data, context=None):
-        """ Create the ERP record """
+        """ Create the OpenERP record """
+        # special check on data before import
+#        self._validate_data(data)
+#        binding = self.model.with_context(
+#            **self._create_context()
+#        ).create(data)
+#        _logger.debug(
+#            '%d created from prestashop %s', binding, self.prestashop_id)
+#        return binding
         if context is None:
             context = self._context()
-        erp_id = self.model.create(
+        binding = self.model.create(
             self.session.cr,
             self.session.uid,
             data,
             context=context
         )
         _logger.debug('%s %d created from prestashop %s',
-                      self.model._name, erp_id, self.prestashop_id)
+                      self.model._name, binding, self.prestashop_id)
         return erp_id
 
-    def _update(self, erp_id, data, context=None):
-        """ Update an ERP record """
+    def _update(self, binding, data, context=None):
+        """ Update an OpenERP record """
+        # special check on data before import
+#        self._validate_data(data)
+#        binding.with_context(connector_no_export=True).write(data)
+#        _logger.debug(
+#            '%d updated from prestashop %s', binding, self.prestashop_id)
         if context is None:
             context = self._context()
         self.model.write(self.session.cr,
                          self.session.uid,
-                         erp_id,
+                         binding,
                          data,
                          context=context)
         _logger.debug('%s %d updated from prestashop %s',
-                      self.model._name, erp_id, self.prestashop_id)
+                      self.model._name, binding, self.prestashop_id)
         return
 
-    def _after_import(self, erp_id):
+    def _before_import(self):
+        """ Hook called before the import, when we have the PrestaShop
+        data"""
+        return
+
+    def _after_import(self, binding):
         """ Hook called at the end of the import """
         return
 
-    def run(self, prestashop_id):
+    @contextmanager
+    def do_in_new_connector_env(self, cr, model_name=None):
+        """ Context manager that yields a new connector environment
+
+        Using a new Odoo Environment thus a new PG transaction.
+
+        This can be used to make a preemptive check in a new transaction,
+        for instance to see if another transaction already made the work.
+        """
+        #with openerp.api.Environment.manage():
+        registry = RegistryManager.get(cr.dbname)
+        with closing(registry.cursor()) as cr:
+            try:
+                new_env = openerp.api.Environment(cr, self.env.uid, self.env.context)
+                new_connector_session = ConnectorSession(cr, uid, context=context)
+                connector_env = self.connector_env.create_environment(
+                    self.backend_record.with_env(new_env),
+                    new_connector_session,
+                    model_name or self.model._name,
+                    connector_env=self.connector_env
+                )
+                yield connector_env
+            except:
+                cr.rollback()
+                raise
+            else:
+                # Despite what pylint says, this a perfectly valid
+                # commit (in a new cursor). Disable the warning.
+                cr.commit()  # pylint: disable=invalid-commit
+
+    def _check_in_new_connector_env(self):
+        with self.do_in_new_connector_env() as new_connector_env:
+            # Even when we use an advisory lock, we may have
+            # concurrent issues.
+            # Explanation:
+            # We import Partner A and B, both of them import a
+            # partner category X.
+            #
+            # The squares represent the duration of the advisory
+            # lock, the transactions starts and ends on the
+            # beginnings and endings of the 'Import Partner'
+            # blocks.
+            # T1 and T2 are the transactions.
+            #
+            # ---Time--->
+            # > T1 /------------------------\
+            # > T1 | Import Partner A       |
+            # > T1 \------------------------/
+            # > T1        /-----------------\
+            # > T1        | Imp. Category X |
+            # > T1        \-----------------/
+            #                     > T2 /------------------------\
+            #                     > T2 | Import Partner B       |
+            #                     > T2 \------------------------/
+            #                     > T2        /-----------------\
+            #                     > T2        | Imp. Category X |
+            #                     > T2        \-----------------/
+            #
+            # As you can see, the locks for Category X do not
+            # overlap, and the transaction T2 starts before the
+            # commit of T1. So no lock prevents T2 to import the
+            # category X and T2 does not see that T1 already
+            # imported it.
+            #
+            # The workaround is to open a new DB transaction at the
+            # beginning of each import (e.g. at the beginning of
+            # "Imp. Category X") and to check if the record has been
+            # imported meanwhile. If it has been imported, we raise
+            # a Retryable error so T2 is rollbacked and retried
+            # later (and the new T3 will be aware of the category X
+            # from the its inception).
+            binder = new_connector_env.get_connector_unit(Binder)
+            if binder.to_openerp(self.prestashop_id):
+                raise RetryableJobError(
+                    'Concurrent error. The job will be retried later',
+                    seconds=RETRY_WHEN_CONCURRENT_DETECTED,
+                    ignore_retry=True
+                )
+
+    def run(self, prestashop_id, **kwargs):
         """ Run the synchronization
 
         :param prestashop_id: identifier of the record on Prestashop
         """
         self.prestashop_id = prestashop_id
-        self.prestashop_record = self._get_prestashop_data()
+        lock_name = 'import({}, {}, {}, {})'.format(
+            self.backend_record._name,
+            self.backend_record.id,
+            self.model._name,
+            self.prestashop_id,
+        )
+        # Keep a lock on this import until the transaction is committed
+        #self.advisory_lock_or_retry(lock_name,
+        #                            retry_seconds=RETRY_ON_ADVISORY_LOCK)
+        if not self.prestashop_record:
+            self.prestashop_record = self._get_prestashop_data()
+
+        binding = self._get_binding()
+        if not binding:
+            self._check_in_new_connector_env()
 
         skip = self._has_to_skip()
         if skip:
@@ -133,24 +304,34 @@ class PrestashopImportSynchronizer(ImportSynchronizer):
         # import the missing linked resources
         self._import_dependencies()
 
-        map_record = self.mapper.map_record(self.prestashop_record)
-        erp_id = self._get_openerp_id()
-        if erp_id:
-            record = map_record.values()
+        self._import(binding, **kwargs)
+
+    def _import(self, binding, **kwargs):
+        """ Import the external record.
+
+        Can be inherited to modify for instance the session
+        (change current user, values in context, ...)
+
+        """
+
+        map_record = self._map_data()
+
+        if binding:
+            record = self._update_data(map_record)
         else:
-            record = map_record.values(for_create=True)
+            record = self._create_data(map_record)
 
         # special check on data before import
         self._validate_data(record)
 
-        if erp_id:
-            self._update(erp_id, record)
+        if binding:
+            self._update(binding, record)
         else:
-            erp_id = self._create(record)
+            binding = self._create(record)
 
-        self.binder.bind(self.prestashop_id, erp_id)
+        self.binder.bind(self.prestashop_id, binding)
 
-        self._after_import(erp_id)
+        self._after_import(binding)
 
     def _check_dependency(self, ext_id, model_name):
         ext_id = int(ext_id)
@@ -189,7 +370,7 @@ class BatchImportSynchronizer(ImportSynchronizer):
 
     def _run_page(self, filters, **kwargs):
         record_ids = self.backend_adapter.search(filters)
-        
+
         for record_id in record_ids:
             self._import_record(record_id, **kwargs)
         return record_ids
@@ -206,39 +387,14 @@ class AddCheckpoint(ConnectorUnit):
 
     _model_name = []
 
-    def run(self, openerp_binding_id):
+    def run(self, binding_id):
         binding = self.session.browse(self.model._name,
-                                      openerp_binding_id)
+                                      binding_id)
         record = binding.openerp_id
         add_checkpoint(self.session,
                        record._model._name,
                        record.id,
                        self.backend_record.id)
-
-
-@prestashop
-class PaymentMethodsImportSynchronizer(BatchImportSynchronizer):
-    _model_name = 'payment.method'
-
-    def run(self, filters=None, **kwargs):
-        if filters is None:
-            filters = {}
-        filters['display'] = '[id,payment]'
-        return super(PaymentMethodsImportSynchronizer, self).run(
-            filters, **kwargs
-        )
-
-    def _import_record(self, record):
-        ids = self.session.search('payment.method', [
-            ('name', '=', record['payment']),
-            ('company_id', '=', self.backend_record.company_id.id),
-        ])
-        if ids:
-            return
-        self.session.create('payment.method', {
-            'name': record['payment'],
-            'company_id': self.backend_record.company_id.id,
-        })
 
 
 @prestashop
@@ -592,22 +748,24 @@ class TranslatableRecordImport(PrestashopImportSynchronizer):
 
     _default_language = 'en_US'
 
+    def __init__(self, environment):
+        """
+        :param environment: current environment (backend, session, ...)
+        :type environment: :py:class:`connector.connector.ConnectorEnvironment`
+        """
+        super(TranslatableRecordImport, self).__init__(environment)
+        self.main_lang_data = None
+        self.main_lang = None
+        self.other_langs_data = None
+
     def _get_oerp_language(self, prestashop_id):
         language_binder = self.get_binder_for_model('prestashop.res.lang')
-        erp_language_id = language_binder.to_openerp(prestashop_id)
-        if erp_language_id is None:
-            return None
-        model = self.environment.session.pool.get('prestashop.res.lang')
-        erp_lang = model.read(
-            self.session.cr,
-            self.session.uid,
-            erp_language_id,
-        )
-        return erp_lang
+        erp_language = language_binder.to_openerp(prestashop_id)
+        return erp_language
 
     def find_each_language(self, record):
         languages = {}
-        for field in self._translatable_fields[self.environment.model_name]:
+        for field in self._translatable_fields[self.connector_env.model_name]:
             # TODO FIXME in prestapyt
             if not isinstance(record[field]['language'], list):
                 record[field]['language'] = [record[field]['language']]
@@ -615,84 +773,99 @@ class TranslatableRecordImport(PrestashopImportSynchronizer):
                 if not language or language['attrs']['id'] in languages:
                     continue
                 erp_lang = self._get_oerp_language(language['attrs']['id'])
-                if erp_lang is not None:
-                    languages[language['attrs']['id']] = erp_lang['code']
+                if erp_lang:
+                    languages[language['attrs']['id']] = erp_lang.code
         return languages
 
-    def _split_per_language(self, record):
-        splitted_record = {}
-        languages = self.find_each_language(record)
-        model_name = self.environment.model_name
-        for language_id, language_code in languages.items():
-            splitted_record[language_code] = record.copy()
-            for field in self._translatable_fields[model_name]:
-                for language in record[field]['language']:
-                    current_id = language['attrs']['id']
-                    current_value = language['value']
-                    if current_id == language_id:
-                        splitted_record[language_code][field] = current_value
-                        break
-        return splitted_record
+    def _split_per_language(self, record, fields=None):
+        """Split record values by language.
 
-    def run(self, prestashop_id):
-        """ Run the synchronization
+        @param record: a record from PS
+        @param fields: fields whitelist
+        @return a dictionary with the following structure:
 
-        :param prestashop_id: identifier of the record on Prestashop
+            'en_US': {
+                'field1': value_en,
+                'field2': value_en,
+            },
+            'it_IT': {
+                'field1': value_it,
+                'field2': value_it,
+            }
         """
-        self.prestashop_id = prestashop_id
-        self.prestashop_record = self._get_prestashop_data()
-        skip = self._has_to_skip()
-        if skip:
-            return skip
+        split_record = {}
+        languages = self.find_each_language(record)
+        if not languages:
+            raise FailedJobError(
+                _('No language mapping defined. '
+                  'Run "Synchronize base data".')
+            )
+        model_name = self.connector_env.model_name
+        for language_id, language_code in languages.iteritems():
+            split_record[language_code] = record.copy()
+        _fields = self._translatable_fields[model_name]
+        if fields:
+            _fields = [x for x in _fields if x in fields]
+        for field in _fields:
+            for language in record[field]['language']:
+                current_id = language['attrs']['id']
+                code = languages.get(current_id)
+                if not code:
+                    # TODO: be nicer here.
+                    # Currently if you have a language in PS
+                    # that is not present in odoo
+                    # the basic metadata sync is broken.
+                    # We should present skip the language
+                    # and maybe show a message to users.
+                    raise FailedJobError(
+                        _('No language could be found for the Prestashop lang '
+                          'with id "%s". Run "Synchronize base data" again.') %
+                        (current_id,)
+                    )
+                split_record[code][field] = language['value']
+        return split_record
 
-        # import the missing linked resources
-        self._import_dependencies()
+    def _create_context(self):
+        context = super(TranslatableRecordImport, self)._create_context()
+        if self.main_lang:
+            context['lang'] = self.main_lang
+        return context
 
+    def _map_data(self):
+        """ Returns an instance of
+        :py:class:`~openerp.addons.connector.unit.mapper.MapRecord`
+
+        """
+        return self.mapper.map_record(self.main_lang_data)
+
+    def _import(self, binding, **kwargs):
+        """ Import the external record.
+
+        Can be inherited to modify for instance the session
+        (change current user, values in context, ...)
+
+        """
         # split prestashop data for every lang
-        splitted_record = self._split_per_language(self.prestashop_record)
-
-        erp_id = None
-
-        if self._default_language in splitted_record:
-            erp_id = self._run_record(
-                splitted_record[self._default_language],
-                self._default_language
-            )
-            del splitted_record[self._default_language]
-
-        for lang_code, prestashop_record in splitted_record.items():
-            erp_id = self._run_record(
-                prestashop_record,
-                lang_code,
-                erp_id
-            )
-
-        self.binder.bind(self.prestashop_id, erp_id)
-
-        self._after_import(erp_id)
-
-    def _run_record(self, prestashop_record, lang_code, erp_id=None):
-        mapped = self.mapper.map_record(prestashop_record)
-
-        if erp_id is None:
-            erp_id = self._get_openerp_id()
-
-        if erp_id:
-            record = mapped.values()
+        split_record = self._split_per_language(self.prestashop_record)
+        if self._default_language in split_record:
+            self.main_lang_data = split_record[self._default_language]
+            self.main_lang = self._default_language
+            del split_record[self._default_language]
         else:
-            record = mapped.values(for_create=True)
+            self.main_lang, self.main_lang_data = split_record.popitem()
 
-        # special check on data before import
-        self._validate_data(record)
+        self.other_langs_data = split_record
 
-        context = self._context()
-        context['lang'] = lang_code
-        if erp_id:
-            self._update(erp_id, record, context)
-        else:
-            erp_id = self._create(record, context)
+        super(TranslatableRecordImport, self)._import(binding)
 
-        return erp_id
+    def _after_import(self, binding):
+        """ Hook called at the end of the import """
+        for lang_code, lang_record in self.other_langs_data.iteritems():
+            map_record = self.mapper.map_record(lang_record)
+            binding.with_context(
+                lang=lang_code,
+                connector_no_export=True,
+            ).write(map_record.values())
 
 
 @prestashop
@@ -1003,21 +1176,23 @@ class ProductPricelistImport(TranslatableRecordImport):
         )
 
 
-@job
+@job(default_channel='root.prestashop')
 def import_batch(session, model_name, backend_id, filters=None, **kwargs):
-    """ Prepare a batch import of records from Prestashop """
+    """ Prepare a batch import of records from PrestaShop """
     env = get_environment(session, model_name, backend_id)
+    #backend = session.pool.get('prestashop.backend').browse(cr, uid, backend_id)
+    #env = backend.get_environment(model_name, session=session)
     importer = env.get_connector_unit(BatchImportSynchronizer)
-    importer.run(filters=filters, **kwargs)
+    return importer.run(filters=filters, **kwargs)
 
 
-@job
-def import_record(session, model_name, backend_id, prestashop_id):
+@job(default_channel='root.prestashop')
+def import_record(
+        session, model_name, backend_id, prestashop_id, **kwargs):
     """ Import a record from Prestashop """
     env = get_environment(session, model_name, backend_id)
     importer = env.get_connector_unit(PrestashopImportSynchronizer)
-    importer.run(prestashop_id)
-
+    return importer.run(prestashop_id, **kwargs)
 
 @job
 def import_product_image(session, model_name, backend_id, product_id,
@@ -1034,8 +1209,7 @@ def import_customers_since(session, backend_id, since_date=None):
 
     filters = None
     if since_date:
-        date_str = since_date.strftime('%Y-%m-%d %H:%M:%S')
-        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (date_str)}
+        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (since_date)}
     now_fmt = datetime.now().strftime(DEFAULT_SERVER_DATETIME_FORMAT)
     import_batch(
         session, 'prestashop.res.partner.category', backend_id, filters
@@ -1059,8 +1233,7 @@ def import_orders_since(session, backend_id, since_date=None):
 
     filters = None
     if since_date:
-        date_str = since_date.strftime('%Y-%m-%d %H:%M:%S')
-        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (date_str)}
+        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (since_date)}
     import_batch(
         session,
         'prestashop.sale.order',
@@ -1071,7 +1244,7 @@ def import_orders_since(session, backend_id, since_date=None):
     )
 
     if since_date:
-        filters = {'date': '1', 'filter[date_add]': '>[%s]' % date_str}
+        filters = {'date': '1', 'filter[date_add]': '>[%s]' % (since_date)}
     try:
         import_batch(session, 'prestashop.mail.message', backend_id, filters)
     except:
@@ -1091,8 +1264,7 @@ def import_orders_since(session, backend_id, since_date=None):
 def import_products(session, backend_id, since_date):
     filters = None
     if since_date:
-        date_str = since_date.strftime('%Y-%m-%d %H:%M:%S')
-        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (date_str)}
+        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (since_date)}
     now_fmt = datetime.now().strftime(DEFAULT_SERVER_DATETIME_FORMAT)
     import_batch(
         session,
@@ -1121,8 +1293,7 @@ def import_products(session, backend_id, since_date):
 def import_refunds(session, backend_id, since_date):
     filters = None
     if since_date:
-        date_str = since_date.strftime('%Y-%m-%d %H:%M:%S')
-        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (date_str)}
+        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (since_date)}
     now_fmt = datetime.now().strftime(DEFAULT_SERVER_DATETIME_FORMAT)
     import_batch(session, 'prestashop.refund', backend_id, filters)
     session.pool.get('prestashop.backend').write(
@@ -1138,8 +1309,7 @@ def import_refunds(session, backend_id, since_date):
 def import_suppliers(session, backend_id, since_date):
     filters = None
     if since_date:
-        date_str = since_date.strftime('%Y-%m-%d %H:%M:%S')
-        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (date_str)}
+        filters = {'date': '1', 'filter[date_upd]': '>[%s]' % (since_date)}
     now_fmt = datetime.now().strftime(DEFAULT_SERVER_DATETIME_FORMAT)
     import_batch(session, 'prestashop.supplier', backend_id, filters)
     import_batch(session, 'prestashop.product.supplierinfo', backend_id)

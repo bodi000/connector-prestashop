@@ -21,7 +21,7 @@ from .connector import add_checkpoint
 @prestashop
 class RefundAdapter(GenericAdapter):
     _model_name = 'prestashop.refund'
-    _prestashop_model = 'order_slips'
+    _prestashop_model = 'order_slip'
 
 
 @prestashop

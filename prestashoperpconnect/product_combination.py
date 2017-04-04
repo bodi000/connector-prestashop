@@ -73,7 +73,7 @@ class ProductCombinationRecordImport(PrestashopImportSynchronizer):
                 'prestashop.product.combination.option.value'
             )
 
-            self.check_location(option_value)
+            #self.check_location(option_value)
 
     def check_location(self, option_value):
         option_binder = self.get_binder_for_model(
@@ -81,7 +81,7 @@ class ProductCombinationRecordImport(PrestashopImportSynchronizer):
         attribute_id = option_binder.to_openerp(
             option_value['id_attribute_group'], unwrap=True)
         product = self.mapper.main_product(self.prestashop_record)
-        attribute_group_id = product.attribute_set_id.attribute_group_ids[0].id
+        attribute_group_id = product.attribute_set_id#.attribute_group_ids[0].id
 
         attribute_location_ids = self.session.search(
             'attribute.location',
@@ -223,6 +223,8 @@ class ProductCombinationMapper(PrestashopImportMapper):
     @mapping
     def attribute_set_id(self, record):
         product = self.main_product(record)
+        #raise osv.except_osv('attrib.prod',product)
+        
         if 'attribute_set_id' in product:
             return {'attribute_set_id': product.attribute_set_id.id}
         return {}

@@ -727,24 +727,40 @@ class PrestashopExportMapper(ExportMapper):
 
 class TranslationPrestashopExportMapper(PrestashopExportMapper):
 
-    def convert(self, records_by_language, fields=None):
-        self.records_by_language = records_by_language
-        first_key = records_by_language.keys()[0]
-        self._convert(records_by_language[first_key], fields=fields)
-        self._data.update(self.convert_languages(self.translatable_fields))
 
-    def convert_languages(self, translatable_fields):
+    @mapping
+    def translatable_fields(self, record):
+        fields = getattr(self, '_translatable_fields', [])
+        if fields:
+            translated_fields = self._convert_languages(
+                self._get_record_by_lang(record), fields)
+            return translated_fields
+        return {}
+
+    def _get_record_by_lang(self, record):
+        # get the backend's languages
+        languages = self.backend_record.language_ids
+        records = {}
+        # for each languages:
+        for language in languages:
+            # get the translated record
+            record = record.with_context(
+                lang=language['code'])
+            # put it in the dict
+            records[language['prestashop_id']] = record
+        return records
+
+    def _convert_languages(self, records_by_language, translatable_fields):
         res = {}
         for from_attr, to_attr in translatable_fields:
             value = {'language': []}
-            for language_id, record in self.records_by_language.items():
+            for language_id, record in records_by_language.iteritems():
                 value['language'].append({
                     'attrs': {'id': str(language_id)},
-                    'value': record[from_attr]
+                    'value': record[from_attr] or ''
                 })
             res[to_attr] = value
         return res
-
 
 @prestashop
 class MailMessageMapper(PrestashopImportMapper):
